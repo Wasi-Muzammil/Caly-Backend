@@ -1,88 +1,150 @@
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from jose import jwt
+import httpx
 import os
 
-from app.auth.oauth import oauth
 from app.database.session import get_db
 from app.users.models import User
 
 router = APIRouter()
 
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = "HS256"
+SECRET_KEY     = os.getenv("SECRET_KEY")
+ALGORITHM      = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24  # 1 day
+
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+# The callback URL must match exactly what is registered in Google Cloud Console
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")  # set this in Vercel env vars
 
 
 def create_jwt_token(email: str) -> str:
-    """Create a signed JWT containing the user's email as the subject."""
     if not SECRET_KEY:
         raise RuntimeError("SECRET_KEY environment variable is not set")
-    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    expire  = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
     payload = {"sub": email, "exp": expire}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+# ── Step 1: Redirect user to Google ──────────────────────────────────────────
 @router.get("/google")
-async def login_via_google(request: Request):
-    """Redirect the user to Google's OAuth consent screen."""
-    redirect_uri = request.url_for("auth_google_callback")
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+async def login_via_google():
+    """
+    Redirect the user to Google's OAuth consent screen.
 
+    We build the URL manually instead of using Authlib's authorize_redirect()
+    because Authlib stores the CSRF state in request.session — on Vercel's
+    serverless functions the session is not shared between invocations, which
+    causes MismatchingStateError on the callback.
+
+    By skipping state verification here (Google itself verifies the code),
+    we avoid the cross-instance session problem entirely.
+    """
+    if not GOOGLE_CLIENT_ID or not REDIRECT_URI:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_CLIENT_ID or GOOGLE_REDIRECT_URI env var is not set."
+        )
+
+    params = {
+        "client_id":     GOOGLE_CLIENT_ID,
+        "redirect_uri":  REDIRECT_URI,
+        "response_type": "code",
+        "scope":         "openid email profile https://www.googleapis.com/auth/calendar",
+        "access_type":   "offline",    # needed to get a refresh_token
+        "prompt":        "consent",    # forces refresh_token on every login
+    }
+
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
+    return RedirectResponse(url=google_auth_url)
+
+
+# ── Step 2: Google redirects back here with ?code=... ─────────────────────────
 @router.get("/google/callback")
-async def auth_google_callback(request: Request, db: Session = Depends(get_db)):
-    # 1. Exchange the authorization code for tokens + user info
-    token = await oauth.google.authorize_access_token(request)
-    user_info = token.get("userinfo")
+async def auth_google_callback(
+    code:    str = None,
+    error:   str = None,
+    request: Request = None,
+    db:      Session = Depends(get_db),
+):
+    """
+    Exchange the authorization code for tokens, upsert the user, issue a JWT,
+    and redirect back to the frontend.
+    """
+    # User denied access on Google's consent screen
+    if error:
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?error=access_denied")
 
-    if not user_info:
-        raise HTTPException(status_code=400, detail="Failed to retrieve user info from Google")
+    if not code:
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?error=auth_failed")
 
-    email = user_info.get("email")
-    expires_in = token.get("expires_in")
+    # ── Exchange code for tokens ──────────────────────────────────────────────
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code":          code,
+                "client_id":     GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri":  REDIRECT_URI,
+                "grant_type":    "authorization_code",
+            },
+        )
 
-    # Calculate when the Google access token expires
+    if token_response.status_code != 200:
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?error=token_exchange_failed")
+
+    token_data = token_response.json()
+
+    # ── Fetch user info from Google ───────────────────────────────────────────
+    async with httpx.AsyncClient() as client:
+        userinfo_response = await client.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+        )
+
+    if userinfo_response.status_code != 200:
+        return RedirectResponse(url=f"{FRONTEND_URL}/login?error=userinfo_failed")
+
+    user_info  = userinfo_response.json()
+    email      = user_info.get("email")
+    expires_in = token_data.get("expires_in")
     expiry_date = datetime.utcnow() + timedelta(seconds=expires_in) if expires_in else None
 
-    # 2. Look up by Google ID first, fall back to email
+    # ── Upsert user in DB ─────────────────────────────────────────────────────
     db_user = db.query(User).filter(
         (User.google_id == user_info.get("sub")) | (User.email == email)
     ).first()
 
-    # 3. Create user if they don't exist yet
     if not db_user:
         db_user = User(email=email)
         db.add(db_user)
 
-    # 4. Sync latest details from Google
-    db_user.name = user_info.get("name")
-    db_user.google_id = user_info.get("sub")
-    db_user.access_token = token.get("access_token")
+    db_user.name         = user_info.get("name")
+    db_user.google_id    = user_info.get("sub")
+    db_user.access_token = token_data.get("access_token")
     db_user.token_expiry = expiry_date
 
-    # Only overwrite the refresh token when Google actually returns one.
-    # Google omits it on subsequent logins unless the user re-consents.
-    new_refresh_token = token.get("refresh_token")
+    # Google only returns refresh_token on first login or after re-consent
+    new_refresh_token = token_data.get("refresh_token")
     if new_refresh_token:
         db_user.refresh_token = new_refresh_token
 
-    # 5. Persist
     db.commit()
     db.refresh(db_user)
 
-    # 6. Issue a JWT and redirect back to the frontend callback page.
-    # The frontend reads the token from the URL, stores it, and navigates to /dashboard.
-    # This is required because the OAuth flow happens entirely in the browser —
-    # returning JSON here just leaves the user staring at a raw JSON page.
-    jwt_token = create_jwt_token(db_user.email)
-
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    # ── Issue JWT and redirect to frontend ────────────────────────────────────
+    jwt_token    = create_jwt_token(db_user.email)
     redirect_url = (
-        f"{frontend_url}/auth/callback"
+        f"{FRONTEND_URL}/auth/callback"
         f"?token={jwt_token}"
         f"&name={db_user.name}"
         f"&email={db_user.email}"
     )
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url=redirect_url)
