@@ -65,21 +65,6 @@ async def login_via_google():
     return RedirectResponse(url=google_auth_url)
 
 
-# ── TEMPORARY DEBUG ENDPOINT — remove after confirming env vars work ─────────
-@router.get("/debug-env")
-async def debug_env():
-    """Shows which env vars are visible to the running function. Remove after debugging."""
-    import os
-    return {
-        "GOOGLE_CLIENT_ID":     os.getenv("GOOGLE_CLIENT_ID",     "NOT SET"),
-        "GOOGLE_REDIRECT_URI":  os.getenv("GOOGLE_REDIRECT_URI",  "NOT SET"),
-        "GOOGLE_CLIENT_SECRET": "SET" if os.getenv("GOOGLE_CLIENT_SECRET") else "NOT SET",
-        "SECRET_KEY":           "SET" if os.getenv("SECRET_KEY")           else "NOT SET",
-        "FRONTEND_URL":         os.getenv("FRONTEND_URL",         "NOT SET"),
-        "DATABASE_URL":         "SET" if os.getenv("DATABASE_URL")         else "NOT SET",
-        "all_env_keys":         [k for k in os.environ.keys()],
-    }
-
 # ── Step 2: Google redirects back here with ?code=... ─────────────────────────
 @router.get("/google/callback")
 async def auth_google_callback(
