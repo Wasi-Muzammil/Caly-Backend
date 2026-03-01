@@ -17,8 +17,33 @@ from typing import List, Dict
 # Types
 # ─────────────────────────────────────────────
 
-Slot     = Dict   # {"start": datetime, "end": datetime}
-BusyMap  = Dict   # {email: [{"start": datetime, "end": datetime}, ...]}
+Slot    = Dict   # {"start": datetime, "end": datetime}
+BusyMap = Dict   # {email: [{"start": datetime, "end": datetime}, ...]}
+
+
+# ─────────────────────────────────────────────
+# Timezone normalisation helper
+# ─────────────────────────────────────────────
+
+def _strip_tz(dt: datetime.datetime) -> datetime.datetime:
+    """
+    Convert any datetime to a naive UTC datetime for safe arithmetic.
+
+    This is the fix for:
+      TypeError: can't subtract offset-naive and offset-aware datetimes
+
+    All slot datetimes come from user input with a +05:00 offset.
+    All busy block datetimes come from Google as UTC-aware.
+    All 'now' comparisons use utcnow() which is naive.
+
+    By converting everything to naive UTC before any arithmetic,
+    all comparisons are safe regardless of the source.
+    """
+    if dt.tzinfo is not None:
+        # Aware datetime — convert to UTC then strip tzinfo
+        return dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    # Already naive — assume it is UTC (how DB values are stored)
+    return dt
 
 
 # ─────────────────────────────────────────────
@@ -27,7 +52,11 @@ BusyMap  = Dict   # {email: [{"start": datetime, "end": datetime}, ...]}
 
 def _overlaps(slot: Slot, busy: Slot) -> bool:
     """Return True if a busy block overlaps with the candidate slot."""
-    return slot["start"] < busy["end"] and slot["end"] > busy["start"]
+    s_start = _strip_tz(slot["start"])
+    s_end   = _strip_tz(slot["end"])
+    b_start = _strip_tz(busy["start"])
+    b_end   = _strip_tz(busy["end"])
+    return s_start < b_end and s_end > b_start
 
 
 def _count_free_participants(slot: Slot, busy_map: BusyMap) -> int:
@@ -41,32 +70,31 @@ def _count_free_participants(slot: Slot, busy_map: BusyMap) -> int:
 
 def _morning_score(slot: Slot) -> int:
     """
-    Award points for slots that fall within the preferred morning window
-    (09:00 – 12:00 local hour of the slot start).
+    Award points for slots that fall within the preferred morning window.
+    Uses the UTC hour — consistent regardless of input timezone.
     """
-    hour = slot["start"].hour
-    if 9 <= hour < 10:
-        return 20
-    if 10 <= hour < 11:
-        return 18
-    if 11 <= hour < 12:
-        return 14
-    if 8 <= hour < 9:
-        return 8      # early but acceptable
-    if 12 <= hour < 14:
-        return 6      # just after lunch
+    hour = _strip_tz(slot["start"]).hour
+    if 9  <= hour < 10: return 20
+    if 10 <= hour < 11: return 18
+    if 11 <= hour < 12: return 14
+    if 8  <= hour < 9:  return 8
+    if 12 <= hour < 14: return 6
     return 0
 
 
 def _earliness_score(slot: Slot, search_start: datetime.datetime, search_end: datetime.datetime) -> int:
     """
     20 pts for the earliest possible slot, 0 for the latest.
-    Linear interpolation across the search window.
+    All three datetimes are normalised to naive UTC before subtraction.
     """
-    total_seconds = (search_end - search_start).total_seconds()
+    slot_start  = _strip_tz(slot["start"])
+    range_start = _strip_tz(search_start)
+    range_end   = _strip_tz(search_end)
+
+    total_seconds = (range_end - range_start).total_seconds()
     if total_seconds <= 0:
         return 20
-    offset = (slot["start"] - search_start).total_seconds()
+    offset = (slot_start - range_start).total_seconds()
     ratio  = max(0.0, min(1.0, offset / total_seconds))
     return round(20 * (1 - ratio))
 
@@ -75,15 +103,17 @@ def _gap_score(slot: Slot) -> int:
     """
     10 pts if the slot starts within 24 hours (urgent scheduling),
     scaled down linearly to 0 pts at 7 days.
+
+    FIX: datetime.utcnow() is naive UTC. slot["start"] may be timezone-aware.
+    Strip both to naive UTC before subtracting to avoid TypeError.
     """
-    now     = datetime.datetime.utcnow()
-    hours   = (slot["start"] - now).total_seconds() / 3600
-    if hours < 0:
-        return 0
-    if hours <= 24:
-        return 10
-    if hours >= 168:   # 7 days
-        return 0
+    now        = datetime.datetime.utcnow()          # naive UTC
+    slot_start = _strip_tz(slot["start"])            # normalised to naive UTC
+
+    hours = (slot_start - now).total_seconds() / 3600
+    if hours < 0:    return 0
+    if hours <= 24:  return 10
+    if hours >= 168: return 0   # 7 days
     return round(10 * (1 - (hours - 24) / 144))
 
 
@@ -100,6 +130,7 @@ def generate_candidate_slots(
     """
     Generate every possible slot of `duration_minutes` length between
     `start` and `end`, advancing by `step_minutes` each time.
+    Preserves the original timezone info so downstream callers can format correctly.
     """
     slots   = []
     current = start
@@ -132,7 +163,7 @@ def rank_slots(
         free_count = _count_free_participants(slot, busy_map)
 
         if free_count == 0:
-            continue   # no point suggesting a slot nobody is free for
+            continue   # skip slots where nobody is free
 
         # ── Scoring ──────────────────────────────────────────────────────
         overlap_score  = round(40 * (free_count / total_participants)) if total_participants else 0
@@ -141,8 +172,7 @@ def rank_slots(
         gap            = _gap_score(slot)
         priority_bonus = 10 if is_priority else 0
 
-        total_score = overlap_score + morning_score + earliness + gap + priority_bonus
-        total_score = min(100, total_score)   # cap at 100
+        total_score = min(100, overlap_score + morning_score + earliness + gap + priority_bonus)
 
         results.append({
             "start":              slot["start"],
@@ -153,6 +183,6 @@ def rank_slots(
             "all_free":           free_count == total_participants,
         })
 
-    # Best score first; ties broken by earliest start
-    results.sort(key=lambda s: (-s["score"], s["start"]))
+    # Best score first; ties broken by earliest start (normalised to UTC for safe comparison)
+    results.sort(key=lambda s: (-s["score"], _strip_tz(s["start"])))
     return results

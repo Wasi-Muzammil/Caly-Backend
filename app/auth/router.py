@@ -30,7 +30,6 @@ async def login_via_google(request: Request):
     redirect_uri = request.url_for("auth_google_callback")
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
-
 @router.get("/google/callback")
 async def auth_google_callback(request: Request, db: Session = Depends(get_db)):
     # 1. Exchange the authorization code for tokens + user info
@@ -72,15 +71,18 @@ async def auth_google_callback(request: Request, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_user)
 
-    # 6. Issue a JWT so the frontend can authenticate future API calls
+    # 6. Issue a JWT and redirect back to the frontend callback page.
+    # The frontend reads the token from the URL, stores it, and navigates to /dashboard.
+    # This is required because the OAuth flow happens entirely in the browser —
+    # returning JSON here just leaves the user staring at a raw JSON page.
     jwt_token = create_jwt_token(db_user.email)
 
-    return {
-        "message": "Login successful",
-        "access_token": jwt_token,       # <-- frontend stores this and sends it in Authorization: Bearer <token>
-        "token_type": "bearer",
-        "user": {
-            "email": db_user.email,
-            "name": db_user.name,
-        },
-    }
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    redirect_url = (
+        f"{frontend_url}/auth/callback"
+        f"?token={jwt_token}"
+        f"&name={db_user.name}"
+        f"&email={db_user.email}"
+    )
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=redirect_url)

@@ -18,7 +18,6 @@ from app.core.security import get_current_user
 from app.users.models import User
 from app.meetings import schemas as mschemas
 from app.meetings.models import Meeting, MeetingParticipant
-from app.meetings.service import get_availability_and_rank
 from app.calendar.service import get_calendar_service, fetch_busy_blocks
 from app.email.email_service import send_confirmation_emails
 import datetime
@@ -40,22 +39,87 @@ def suggest_slots(
     """
     Compare all participants' Google Calendar availability and return
     ranked meeting slot suggestions.
+
+    Participants who haven't connected Google Calendar are handled gracefully:
+      - Registered + connected   → fetch busy blocks from Google Calendar API
+      - Registered + no OAuth    → fetch busy blocks from internal DB meetings
+      - Not registered at all    → treated as always free, warning added
     """
     # Always include the current user as a participant
     all_participants = list(set(payload.participants + [current_user.email]))
 
-    ranked_slots, warnings = get_availability_and_rank(
-        db                = db,
-        participant_emails = all_participants,
-        duration_minutes   = payload.duration_minutes,
-        search_start       = payload.start_date,
-        search_end         = payload.end_date,
+    # ── Build busy_map manually so we can apply the same DB fallback
+    # as /availability — service.py only checks Google, not internal DB ──────
+    import pytz
+    busy_map = {}
+    warnings = []
+
+    search_start = payload.start_date
+    search_end   = payload.end_date
+
+    # Naive UTC boundaries for DB queries (DB stores local-input times)
+    db_start = search_start.replace(tzinfo=None) if search_start.tzinfo else search_start
+    db_end   = search_end.replace(tzinfo=None)   if search_end.tzinfo   else search_end
+
+    for email in all_participants:
+        user = db.query(User).filter(User.email == email).first()
+
+        if user and user.access_token:
+            # ── Connected to Google → fetch from Calendar API ─────────────
+            try:
+                service, _ = get_calendar_service(
+                    access_token  = user.access_token,
+                    refresh_token = user.refresh_token,
+                    token_expiry  = user.token_expiry,
+                )
+                busy_map[email] = fetch_busy_blocks(service, search_start, search_end)
+            except Exception as exc:
+                warnings.append(f"Could not fetch calendar for {email}: {str(exc)}")
+                busy_map[email] = []
+
+        elif user and not user.access_token:
+            # ── Registered but not connected → fall back to internal DB ───
+            db_meetings = (
+                db.query(Meeting)
+                .join(MeetingParticipant, Meeting.id == MeetingParticipant.meeting_id)
+                .filter(
+                    MeetingParticipant.email == email,
+                    Meeting.scheduled_start  >= db_start,
+                    Meeting.scheduled_end    <= db_end,
+                    Meeting.status           == "confirmed",
+                )
+                .all()
+            )
+            busy_map[email] = [
+                {"start": m.scheduled_start, "end": m.scheduled_end}
+                for m in db_meetings
+            ]
+            warnings.append(
+                f"{email} has not connected Google Calendar. "
+                "Showing availability from internal meetings only."
+            )
+
+        else:
+            # ── Not registered at all → treat as always free ──────────────
+            busy_map[email] = []
+            warnings.append(
+                f"{email} is not registered. Their availability could not be checked."
+            )
+
+    # ── Rank the candidate slots ──────────────────────────────────────────
+    from app.meetings.ranking import generate_candidate_slots, rank_slots
+    candidates   = generate_candidate_slots(search_start, search_end, payload.duration_minutes)
+    ranked_slots = rank_slots(
+        candidate_slots    = candidates,
+        busy_map           = busy_map,
+        total_participants = len(all_participants),
+        search_start       = search_start,
+        search_end         = search_end,
         is_priority        = payload.is_priority,
-        max_slots          = payload.max_slots,
-    )
+    )[:payload.max_slots]
 
     if not ranked_slots:
-        warnings.append("No available slots found for all participants in the given window.")
+        warnings.append("No available slots found for the given participants and time window.")
 
     return mschemas.SuggestResponse(slots=ranked_slots, warnings=warnings)
 
@@ -173,40 +237,117 @@ def get_availability_timeline(
     """
     Return each participant's busy blocks for a given date.
     Used to render the visual calendar-style availability timeline.
-    """
-    # Scope the search to the full requested day (UTC)
-    day_start = payload.date.replace(hour=0,  minute=0,  second=0,  microsecond=0)
-    day_end   = payload.date.replace(hour=23, minute=59, second=59, microsecond=0)
 
-    all_emails   = list(set(payload.participants + [current_user.email]))
-    timelines    = []
-    warnings     = []
+    Two sources of busy data:
+      1. Google Calendar API  — for registered users who have connected Google
+      2. Internal DB meetings — for participants who haven't connected Google
+                                (covers the case of vroomrentalsystem@gmail.com
+                                 being added as participant but never logged in)
+    """
+    import pytz
+    import datetime as _dt
+
+    # ── Resolve the user's local timezone ────────────────────────────────────
+    try:
+        local_tz = pytz.timezone(payload.timezone)   # e.g. Asia/Karachi
+    except pytz.UnknownTimeZoneError:
+        local_tz = pytz.utc
+
+    # ── Compute day boundaries in LOCAL time, then convert to UTC for Google ─
+    # Example for Asia/Karachi (UTC+5):
+    #   Local day start = 2026-03-02 00:00:00 PKT
+    #   UTC equivalent  = 2026-03-01 19:00:00 UTC   ← what we send to Google
+    local_midnight = payload.date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    local_end      = payload.date.replace(hour=23, minute=59, second=59, microsecond=0, tzinfo=None)
+
+    local_day_start = local_tz.localize(local_midnight)
+    local_day_end   = local_tz.localize(local_end)
+
+    utc_day_start = local_day_start.astimezone(pytz.utc)
+    utc_day_end   = local_day_end.astimezone(pytz.utc)
+
+    # DB stores the local time the user entered (not UTC).
+    # So filter the DB using local day boundaries, not UTC boundaries.
+    db_day_start = local_midnight   # e.g. 2026-03-02 00:00:00 (local, naive)
+    db_day_end   = local_end        # e.g. 2026-03-02 23:59:59 (local, naive)
+
+    all_emails = list(set(payload.participants + [current_user.email]))
+    timelines  = []
+    warnings   = []
+
+    def _fmt_local(dt) -> str:
+        """
+        Convert a UTC-aware datetime from Google to local timezone string.
+        This is the core fix: Google returns 07:00 UTC, we display 12:00 PKT.
+        """
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        local_dt = dt.astimezone(local_tz)
+        return local_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     for email in all_emails:
-        user = db.query(User).filter(User.email == email).first()
+        user        = db.query(User).filter(User.email == email).first()
+        busy_blocks = []
 
-        if not user or not user.access_token:
-            warnings.append(f"{email} has not connected Google Calendar.")
-            timelines.append(mschemas.ParticipantTimeline(email=email, busy_blocks=[]))
-            continue
+        # ── Source 1: Google Calendar API (for connected users) ───────────
+        if user and user.access_token:
+            try:
+                service, _ = get_calendar_service(
+                    access_token  = user.access_token,
+                    refresh_token = user.refresh_token,
+                    token_expiry  = user.token_expiry,
+                )
+                # fetch_busy_blocks now returns UTC-aware datetimes
+                google_busy = fetch_busy_blocks(service, utc_day_start, utc_day_end)
+                busy_blocks.extend([
+                    {
+                        # Convert UTC → local timezone before returning to client
+                        "start": _fmt_local(b["start"]),
+                        "end":   _fmt_local(b["end"]),
+                    }
+                    for b in google_busy
+                ])
+            except Exception as e:
+                warnings.append(f"Could not fetch Google Calendar for {email}: {str(e)}")
 
-        try:
-            service, _ = get_calendar_service(
-                access_token  = user.access_token,
-                refresh_token = user.refresh_token,
-                token_expiry  = user.token_expiry,
+        else:
+            # ── Source 2: Internal DB meetings (fallback) ─────────────────
+            # Participants who haven't connected Google OAuth still show their
+            # busy time from meetings stored in our own DB.
+            db_meetings = (
+                db.query(Meeting)
+                .join(MeetingParticipant, Meeting.id == MeetingParticipant.meeting_id)
+                .filter(
+                    MeetingParticipant.email == email,
+                    Meeting.scheduled_start  >= db_day_start,
+                    Meeting.scheduled_end    <= db_day_end,
+                    Meeting.status           == "confirmed",
+                )
+                .all()
             )
-            busy = fetch_busy_blocks(service, day_start, day_end)
-            timelines.append(mschemas.ParticipantTimeline(
-                email       = email,
-                busy_blocks = [{"start": str(b["start"]), "end": str(b["end"])} for b in busy],
-            ))
-        except Exception as e:
-            warnings.append(f"Could not fetch calendar for {email}: {str(e)}")
-            timelines.append(mschemas.ParticipantTimeline(email=email, busy_blocks=[]))
+            busy_blocks.extend([
+                {
+                    # DB stores the local time the user originally entered (e.g. 12:00 PKT).
+                    # Do NOT treat it as UTC and convert — that would add +5 again → 17:00.
+                    # Just format it directly as-is since it is already in local time.
+                    "start": m.scheduled_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end":   m.scheduled_end.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for m in db_meetings
+            ])
+
+            if not user:
+                warnings.append(f"{email} is not registered. Showing no availability.")
+            else:
+                warnings.append(
+                    f"{email} has not connected Google Calendar. "
+                    f"Showing availability from internal meetings only.",
+                )
+
+        timelines.append(mschemas.ParticipantTimeline(email=email, busy_blocks=busy_blocks))
 
     return mschemas.AvailabilityResponse(
-        date         = payload.date.strftime("%Y-%m-%d"),
+        date         = local_midnight.strftime("%Y-%m-%d"),
         participants = timelines,
         warnings     = warnings,
     )
