@@ -23,7 +23,7 @@ When someone wants to schedule a meeting, Caly does the following automatically:
 |---|---|
 | FastAPI | Web framework — handles all API routes |
 | SQLAlchemy | Database ORM — manages tables and queries |
-| SQLite | Database — stores users, meetings, participants |
+| NeonDB-Postgres | Database — stores users, meetings, participants |
 | Google OAuth 2.0 | Secure Google login |
 | Google Calendar API | Reads calendar availability |
 | python-jose | Creates and verifies JWT tokens |
@@ -112,7 +112,7 @@ GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
 GOOGLE_REDIRECT_URI=http://localhost:8000/auth/callback
 SECRET_KEY=any_long_random_string
-DATABASE_URL=sqlite:///./caly.db
+DATABASE_URL=postgresql://user:password@ep-xxxx.us-east-2.aws.neon.tech/dbname?sslmode=require
 SMTP_EMAIL=your_gmail@gmail.com
 SMTP_PASSWORD=your_gmail_app_password
 ```
@@ -199,7 +199,7 @@ To enable this, you need a Gmail **App Password** (not your regular Gmail passwo
 | `GOOGLE_CLIENT_SECRET` | From Google Cloud Console → Credentials |
 | `GOOGLE_REDIRECT_URI` | Must match exactly what you set in Google Console |
 | `SECRET_KEY` | Any random string used to sign JWT tokens |
-| `DATABASE_URL` | Path to your SQLite database file |
+| `DATABASE_URL` | Path to your Postgres database |
 | `SMTP_EMAIL` | Your Gmail address for sending emails |
 | `SMTP_PASSWORD` | Your Gmail App Password (not your regular password) |
 
@@ -223,8 +223,6 @@ If you want to start fresh and delete all data:
 # Stop the server
 Ctrl + C
 
-# Delete the database file
-rm caly.db
 
 # Restart — tables are recreated automatically
 uvicorn main:app --reload
